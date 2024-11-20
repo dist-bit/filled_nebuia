@@ -400,47 +400,33 @@ func (fr *FileRepository) AddEntitiesToDocumentInBatch(uuid string, entities map
 	return nil
 }
 
-func (fr *FileRepository) GetDocumentsFromBatch(batchID string) ([]bson.M, error) {
-	fr.logger.Info("Retrieving 'in_list_llm' documents for batch: %s", batchID)
-	objID, err := primitive.ObjectIDFromHex(batchID)
-	if err != nil {
-		fr.logger.Error("Invalid batch ID format: %v", err)
-		return nil, err
-	}
+func (fl *FileService) GetItemToWork() ([]bson.M, error) {
+	//fs.logger.Debug("Fetching items with status 'in_list_llm'")
 
 	filter := bson.M{
-		"batch_id": objID,
+		"status_document": "in_list_llm",
 	}
 
-	cursor, err := fr.documents.Find(context.Background(), filter)
+	cursor, err := fl.repo.documents.Find(context.Background(), filter)
 	if err != nil {
-		fr.logger.Error("Failed to find documents: %v", err)
+		fl.logger.Warning("Failed to find documents: %v", err)
 		return nil, err
 	}
 	defer cursor.Close(context.Background())
 
-	var allResults []bson.M
-	if err = cursor.All(context.Background(), &allResults); err != nil {
-		fr.logger.Error("Failed to decode documents: %v", err)
+	var documents []bson.M
+	if err = cursor.All(context.Background(), &documents); err != nil {
+		fl.logger.Error("Failed to decode documents: %v", err)
 		return nil, err
 	}
 
-	// Filtrar solo documentos con status_document = "in_list_llm"
-	var filteredResults []bson.M
-	for _, doc := range allResults {
-		if status, ok := doc["status_document"].(string); ok && status == "in_list_llm" {
-			filteredResults = append(filteredResults, doc)
-		}
+	if len(documents) == 0 {
+		//fs.logger.Info("No documents found with status 'in_list_llm'")
+		return nil, nil
 	}
 
-	fr.logger.Success("Retrieved %d 'in_list_llm' documents from batch (from total %d)",
-		len(filteredResults), len(allResults))
-
-	if len(filteredResults) == 0 {
-		fr.logger.Warning("No documents with status 'in_list_llm' found in batch")
-	}
-
-	return filteredResults, nil
+	fl.logger.Success("Found %d documents to process with status 'in_list_llm'", len(documents))
+	return documents, nil
 }
 
 // PipelineRepository handles pipeline operations
@@ -534,21 +520,6 @@ func (fs *FileService) RemoveItem(batchID string) error {
 	}
 	fs.logger.Success("Removed %d occurrences of batch '%s'", count, batchID)
 	return nil
-}
-
-func (fs *FileService) GetItemToWork() (string, error) {
-	//fs.logger.Debug("Fetching next item to work on")
-	batchID, err := fs.source.LIndex(context.Background(), "to_operate", -1).Result()
-	if err != nil {
-		if err == redis.Nil {
-			//fs.logger.Info("No items found in queue")
-			return "", nil
-		}
-		fs.logger.Warning("Failed to get next item: %v", err)
-		return "", err
-	}
-	fs.logger.Success("Found batch to process: %s", batchID)
-	return batchID, nil
 }
 
 func (fs *FileService) ProcessPipelineToDocument(ctx context.Context, pipe bson.M, doc bson.M) (string, int, error) {
@@ -875,20 +846,25 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func (fs *FileService) ApplyAllToBatch(batchID string) error {
-	fs.logger.Info("Starting batch processing: %s", batchID)
+func (fs *FileService) ApplyAllToBatch() error {
+	// with status 'in_list_llm'")
 
-	// Crear un contexto cancelable para este batch
+	// Crear un contexto cancelable
 	ctx, cancel := context.WithCancel(fs.ctx)
 	defer cancel()
 
-	documents, err := fs.repo.GetDocumentsFromBatch(batchID)
+	documents, err := fs.GetItemToWork()
 	if err != nil {
-		fs.logger.Error("Failed to get documents from batch: %v", err)
-		return fmt.Errorf("error getting documents from batch: %v", err)
+		fs.logger.Error("Failed to get documents to process: %v", err)
+		return fmt.Errorf("error getting documents to process: %v", err)
 	}
 
-	fs.logger.Info("Processing %d documents in batch", len(documents))
+	if len(documents) == 0 {
+		//fs.logger.Info("No documents to process")
+		return nil
+	}
+
+	fs.logger.Info("Processing %d documents", len(documents))
 
 	// Canal para documentos a procesar
 	workChan := make(chan bson.M, len(documents))
@@ -936,17 +912,17 @@ func (fs *FileService) ApplyAllToBatch(batchID string) error {
 	for err := range errorChan {
 		if err != nil {
 			errCount++
-			fs.logger.Error("Batch processing error: %v", err)
+			fs.logger.Error("Document processing error: %v", err)
 		}
 	}
 
 	if errCount > 0 {
-		fs.logger.Warning("Batch completed with %d errors", errCount)
+		fs.logger.Warning("Processing completed with %d errors", errCount)
 	} else {
-		fs.logger.Success("Batch processed successfully")
+		fs.logger.Success("All documents processed successfully")
 	}
 
-	return fs.RemoveItem(batchID)
+	return nil
 }
 
 // Worker handles the continuous processing of items
@@ -988,22 +964,13 @@ func (w *Worker) worker() {
 			w.logger.Info("Received stop signal")
 			return
 		default:
-			item, err := w.fileService.GetItemToWork()
-
-			if err == nil {
-				if item != "" {
-					w.logger.Info("Processing item: %s", item)
-					if err := w.fileService.ApplyAllToBatch(item); err != nil {
-						w.logger.Critical("Fatal error in batch processing: %v", err)
-						return
-					}
-				}
-
-			} else {
-				w.logger.Error(err.Error())
-				//w.logger.Debug("No items to process, waiting...")
-				time.Sleep(time.Second)
+			if err := w.fileService.ApplyAllToBatch(); err != nil {
+				w.logger.Critical("Fatal error in document processing: %v", err)
+				return
 			}
+
+			// Pequeña pausa para no saturar el sistema
+			time.Sleep(time.Second)
 		}
 	}
 }
