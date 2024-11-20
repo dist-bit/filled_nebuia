@@ -113,9 +113,8 @@ func (l *Logger) Critical(format string, args ...interface{}) {
 
 // OpenAIClient handles LLM operations
 type OpenAIClient struct {
-	Extractor       *openai.Client
-	ModelsExtractor openai.ModelsList
-	logger          *Logger
+	Extractor *openai.Client
+	logger    *Logger
 }
 
 func NewOpenAIClient() *OpenAIClient {
@@ -127,20 +126,15 @@ func NewOpenAIClient() *OpenAIClient {
 	extractorServer := os.Getenv("EXTRACTOR_SERVER")
 	extractorConfig.BaseURL = extractorServer
 	extractorConfig.HTTPClient = &http.Client{
-		Timeout: 20 * time.Second,
+		Timeout: 60 * time.Second,
 	}
 
 	extractorClient := openai.NewClientWithConfig(extractorConfig)
-	modelsExtractor, err := extractorClient.ListModels(context.Background())
-	if err != nil {
-		logger.Warning("Failed to list models: %v", err)
-	}
 
 	logger.Success("OpenAI client initialized successfully")
 	return &OpenAIClient{
-		Extractor:       extractorClient,
-		ModelsExtractor: modelsExtractor,
-		logger:          logger,
+		Extractor: extractorClient,
+		logger:    logger,
 	}
 }
 
