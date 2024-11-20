@@ -671,11 +671,9 @@ Content Preview (first 500 chars):
 Pipeline Name: %s
 Document ID: %s
 Error: %v
-Response:
-%s
-Schema:
-%s
-`, pipe["name"], doc["uuid"], err, *response, schema)
+Schema: %s
+Response: %v
+`, pipe["name"], doc["uuid"], err, schema, *response)
 			return "error_en_extraccion", -1, err
 		}
 
@@ -742,7 +740,7 @@ func (lb *LoadBalancedOpenAIClient) ExtractorInference(ctx context.Context, text
 		ctx,
 		openai.CompletionRequest{
 			Model:     "extractor",
-			MaxTokens: 512,
+			MaxTokens: 1024,
 			Stop:      []string{"<|end-output|>"},
 			Prompt:    prompt,
 		},
@@ -761,6 +759,128 @@ func (lb *LoadBalancedOpenAIClient) ExtractorInference(ctx context.Context, text
 	return &structure, nil
 }
 
+func (fs *FileService) processDocument(ctx context.Context, doc bson.M, errorChan chan<- error) {
+	startTime := time.Now()
+	docUUID := doc["uuid"].(string)
+	fs.logger.Debug("Starting processing document: %s", docUUID)
+
+	typeDoc := doc["type_document"].(primitive.ObjectID).Hex()
+	pipes, err := fs.pipe.GetPipelinesByApplyTo(typeDoc)
+	if err != nil {
+		fs.logger.Warning("Error getting pipelines for document %s: %v", docUUID, err)
+		fs.repo.SetDocumentReviewStatus("error_on_extraction", docUUID)
+		errorChan <- err
+		return
+	}
+
+	pipeArray, ok := pipes["pipelines"].(primitive.A)
+	if !ok {
+		fs.logger.Error("Invalid pipeline format for document %s", docUUID)
+		errorChan <- fmt.Errorf("invalid pipeline format")
+		return
+	}
+
+	// Canal para resultados de los pipelines
+	type pipelineResult struct {
+		entities   map[string]interface{}
+		err        error
+		pipelineID string
+		duration   time.Duration
+	}
+	resultsChan := make(chan pipelineResult, len(pipeArray))
+
+	// WaitGroup para esperar que todos los pipelines terminen
+	var wg sync.WaitGroup
+
+	// Procesar cada pipeline en paralelo
+	for _, pipe := range pipeArray {
+		pipeMap, ok := pipe.(bson.M)
+		if !ok {
+			fs.logger.Warning("Invalid pipeline item format, skipping")
+			continue
+		}
+
+		wg.Add(1)
+		go func(pipe bson.M) {
+			pipelineStartTime := time.Now()
+			defer wg.Done()
+
+			pipelineName := pipe["name"].(string)
+			result, page, err := fs.ProcessPipelineToDocument(ctx, pipe, doc)
+			duration := time.Since(pipelineStartTime)
+
+			if err != nil {
+				fs.logger.Error("Pipeline '%s' processing failed for document %s: %v",
+					pipelineName, docUUID, err)
+				resultsChan <- pipelineResult{
+					err:        err,
+					pipelineID: pipelineName,
+					duration:   duration,
+				}
+				return
+			}
+
+			entities := map[string]interface{}{
+				"key":      pipe["name"],
+				"value":    result,
+				"page":     page,
+				"id_core":  pipe["id_core"],
+				"duration": duration.Milliseconds(),
+			}
+
+			resultsChan <- pipelineResult{
+				entities:   entities,
+				pipelineID: pipelineName,
+				duration:   duration,
+			}
+		}(pipeMap)
+	}
+
+	// Goroutine para cerrar el canal de resultados después de que todos los pipelines terminen
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Procesar resultados según llegan
+	for result := range resultsChan {
+		if result.err != nil {
+			continue
+		}
+
+		err := fs.repo.AddEntitiesToDocumentInBatch(docUUID, result.entities)
+		if err != nil {
+			fs.logger.Error("Failed to add entities to document %s: %v\nEntities attempted: %+v",
+				docUUID, err, result.entities)
+			continue
+		}
+	}
+
+	// Formatear tiempo total de procesamiento
+	totalDuration := time.Since(startTime)
+	durationStr := formatDuration(totalDuration)
+
+	fs.logger.Info("Document %s processed in %s", docUUID, durationStr)
+	fs.repo.SetDocumentReviewStatus("complete_qa", docUUID)
+}
+
+// formatDuration convierte una duración a un formato legible
+func formatDuration(d time.Duration) string {
+	seconds := int(d.Seconds())
+	minutes := seconds / 60
+	hours := minutes / 60
+
+	if hours > 0 {
+		minutes = minutes % 60
+		return fmt.Sprintf("%d hours %d minutes", hours, minutes)
+	} else if minutes > 0 {
+		seconds = seconds % 60
+		return fmt.Sprintf("%d minutes %d seconds", minutes, seconds)
+	} else {
+		return fmt.Sprintf("%d seconds", seconds)
+	}
+}
+
 func (fs *FileService) ApplyAllToBatch(batchID string) error {
 	fs.logger.Info("Starting batch processing: %s", batchID)
 
@@ -776,89 +896,42 @@ func (fs *FileService) ApplyAllToBatch(batchID string) error {
 
 	fs.logger.Info("Processing %d documents in batch", len(documents))
 
+	// Canal para documentos a procesar
+	workChan := make(chan bson.M, len(documents))
 	// Canal para errores
 	errorChan := make(chan error, len(documents))
-	// WaitGroup para esperar que todos los documentos se procesen
+
+	// Número de workers basado en la configuración
+	numWorkers := fs.config.MaxConcurrentDocuments
+
+	// WaitGroup para esperar que todos los workers terminen
 	var wg sync.WaitGroup
 
-	// Semáforo para limitar la concurrencia
-	sem := make(chan struct{}, fs.config.MaxConcurrentDocuments)
-
-	for _, doc := range documents {
+	// Iniciar workers
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-
-		go func(doc bson.M) {
+		go func(workerID int) {
 			defer wg.Done()
-
-			// Adquirir slot del semáforo
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
+			for doc := range workChan {
+				fs.processDocument(ctx, doc, errorChan)
 			}
-
-			docUUID := doc["uuid"].(string)
-			fs.logger.Debug("Processing document: %s", docUUID)
-
-			typeDoc := doc["type_document"].(primitive.ObjectID).Hex()
-			pipes, err := fs.pipe.GetPipelinesByApplyTo(typeDoc)
-			if err != nil {
-				fs.logger.Warning("Error getting pipelines for document %s: %v", docUUID, err)
-				fs.repo.SetDocumentReviewStatus("error_on_extraction", docUUID)
-				errorChan <- err
-				return
-			}
-
-			pipeArray, ok := pipes["pipelines"].(primitive.A)
-			if !ok {
-				fs.logger.Error("Invalid pipeline format for document %s", docUUID)
-				errorChan <- fmt.Errorf("invalid pipeline format")
-				return
-			}
-
-			for _, pipe := range pipeArray {
-				pipeMap, ok := pipe.(bson.M)
-				if !ok {
-					fs.logger.Warning("Invalid pipeline item format, skipping")
-					continue
-				}
-
-				pipelineName := pipeMap["name"].(string)
-				//fs.logger.Debug("Applying pipeline '%s' to document %s", pipelineName, docUUID)
-
-				result, page, err := fs.ProcessPipelineToDocument(ctx, pipeMap, doc)
-				if err != nil {
-					fs.logger.Error("Pipeline '%s' processing failed for document %s: %v",
-						pipelineName, docUUID, err)
-					continue
-				}
-
-				entities := map[string]interface{}{
-					"key":     pipeMap["name"],
-					"value":   result,
-					"page":    page,
-					"id_core": pipeMap["id_core"],
-				}
-
-				err = fs.repo.AddEntitiesToDocumentInBatch(docUUID, entities)
-				if err != nil {
-					fs.logger.Error("Failed to add entities to document %s from pipeline '%s': %v\nEntities attempted: %+v",
-						docUUID,
-						pipelineName,
-						err,
-						entities)
-					continue
-				}
-
-				//fs.logger.Success("Successfully processed pipeline '%s' for document %s", pipelineName, docUUID)
-			}
-
-			fs.repo.SetDocumentReviewStatus("complete_qa", docUUID)
-		}(doc)
+		}(i)
 	}
 
-	// Esperar a que todos los documentos se procesen
+	// Enviar documentos al canal de trabajo
+	for _, doc := range documents {
+		select {
+		case workChan <- doc:
+		case <-ctx.Done():
+			close(workChan)
+			return ctx.Err()
+		}
+	}
+
+	// Cerrar el canal de trabajo cuando todos los documentos han sido enviados
+	close(workChan)
+
+	// Esperar a que todos los workers terminen
 	wg.Wait()
 
 	// Cerrar el canal de errores
