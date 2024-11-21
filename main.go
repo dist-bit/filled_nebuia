@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -15,7 +16,10 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
+	"github.com/kataras/golog"
 	"github.com/meilisearch/meilisearch-go"
+	"github.com/pkoukk/tiktoken-go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/sashabaranov/go-openai"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -197,28 +201,85 @@ func (lb *LoadBalancedOpenAIClient) startHealthChecks() {
 func (lb *LoadBalancedOpenAIClient) checkHealth() {
 	for _, extractor := range lb.extractors {
 		go func(e *ExtractorClient) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
 
-			_, err := e.client.ListModels(ctx)
+			// Query metrics endpoint
+			url := strings.Replace(e.baseURL, "/v1", "/metrics", 1)
+
+			resp, err := http.Get(url)
+			if err != nil {
+				lb.handleHealthError(e, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Parse metrics
+			if resp.StatusCode != http.StatusOK {
+				lb.handleHealthError(e, fmt.Errorf("metrics endpoint returned status %d", resp.StatusCode))
+				return
+			}
+
+			parser := expfmt.TextParser{}
+			metrics, err := parser.TextToMetricFamilies(resp.Body)
+			if err != nil {
+				lb.handleHealthError(e, err)
+				return
+			}
+
+			// Check key health indicators
+			healthy := true
+
+			// Check if server is processing requests
+			if running, ok := metrics["vllm:num_requests_running"]; ok {
+				if running.GetMetric()[0].GetGauge().GetValue() < 0 {
+					healthy = false
+				}
+			}
+
+			// Check recent request success rate
+			if succeeded, ok := metrics["vllm:request_success_total"]; ok {
+				total := float64(0)
+				for _, m := range succeeded.GetMetric() {
+					total += m.GetCounter().GetValue()
+				}
+				if total == 0 {
+					healthy = false
+				}
+			}
+
+			// Check latency indicators
+			if latency, ok := metrics["vllm:time_to_first_token_seconds"]; ok {
+				hist := latency.GetMetric()[0].GetHistogram()
+				if hist.GetSampleCount() == 0 || hist.GetSampleSum()/float64(hist.GetSampleCount()) > 10.0 {
+					healthy = false
+				}
+			}
 
 			lb.healthMutex.Lock()
 			defer lb.healthMutex.Unlock()
 
-			if err != nil {
+			if !healthy {
 				if lb.healthChecks[e.baseURL] {
-					lb.logger.Error("Error health %s", err.Error())
-					lb.logger.Warning("Server %s is down: %v", e.name, err)
+					lb.logger.Warning("Server %s is unhealthy based on metrics", e.name)
 				}
 				lb.healthChecks[e.baseURL] = false
 			} else {
 				if !lb.healthChecks[e.baseURL] {
-					lb.logger.Success("Server %s is back online", e.name)
+					lb.logger.Success("Server %s is healthy and processing requests", e.name)
 				}
 				lb.healthChecks[e.baseURL] = true
 			}
 		}(extractor)
 	}
+}
+
+func (lb *LoadBalancedOpenAIClient) handleHealthError(e *ExtractorClient, err error) {
+	lb.healthMutex.Lock()
+	defer lb.healthMutex.Unlock()
+
+	if lb.healthChecks[e.baseURL] {
+		lb.logger.Error("Health check error for %s: %v", e.name, err)
+	}
+	lb.healthChecks[e.baseURL] = false
 }
 
 func (lb *LoadBalancedOpenAIClient) getNextHealthyClient() *ExtractorClient {
@@ -522,6 +583,37 @@ func (fs *FileService) RemoveItem(batchID string) error {
 	return nil
 }
 
+func getCombinedContent(hits []interface{}) (string, error) {
+	encoding := "cl100k_base"
+	tke, err := tiktoken.GetEncoding(encoding)
+	if err != nil {
+		return "", err
+	}
+
+	hit0 := hits[0].(map[string]interface{})
+	combinedContent := hit0["content"].(string)
+
+	tokens := tke.Encode(combinedContent, nil, nil)
+	tokenCount := len(tokens)
+
+	for i := 1; i < len(hits); i++ {
+		hit := hits[i].(map[string]interface{})
+		if content, ok := hit["content"].(string); ok {
+			potentialTokens := tke.Encode(content, nil, nil)
+			newTokenCount := tokenCount + len(potentialTokens)
+
+			if newTokenCount <= 4700 {
+				combinedContent += "\n" + content
+				tokenCount = newTokenCount
+			} else {
+				break
+			}
+		}
+	}
+
+	return combinedContent, nil
+}
+
 func (fs *FileService) ProcessPipelineToDocument(ctx context.Context, pipe bson.M, doc bson.M) (string, int, error) {
 	select {
 	case fs.extractionSemaphore <- struct{}{}: // Adquirir un slot para extracción
@@ -592,14 +684,11 @@ Value: %v
 			page = -1
 		}
 
-		combinedContent := hit0["content"].(string)
-		/*if len(hits) > 1 {
-			if hit1, ok := hits[1].(map[string]interface{}); ok {
-				if content, ok := hit1["content"].(string); ok {
-					combinedContent += "\n" + content
-				}
-			}
-		}*/
+		combinedContent, err := getCombinedContent(hits)
+		if err != nil {
+			golog.Error(err)
+			combinedContent = hit0["content"].(string)
+		}
 
 		schema := generateSchema(pipe)
 		/*fs.logger.Debug(`
